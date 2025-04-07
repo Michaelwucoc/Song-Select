@@ -135,7 +135,7 @@ function App() {
 
   const handleSongSelect = async (song) => {
     try {
-      const response = await fetch('/api/songs/submit', {
+      const submitResponse = await fetch('/api/songs/submit', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
@@ -149,9 +149,41 @@ function App() {
         })
       });
 
-      if (!response.ok) {
-        throw new Error('提交失败');
+      const submitData = await submitResponse.json();
+      if (!submitResponse.ok) {
+        throw new Error(submitData.error || '提交失败');  
       }
+
+      setSelectedSong(submitData);
+      setShowPaymentModal(true);
+    } catch (err) {
+      setError(err.message || '提交失败');
+    }
+  };
+
+  const handlePayment = async (payType) => {
+    try {
+      setShowPaymentModal(false);
+      
+      const payResponse = await fetch(`/api/songs/${selectedSong.id}/pay`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          payType,
+          payment_amount: 5.00
+        })
+      });
+
+      if (!payResponse.ok) {
+        throw new Error('支付失败');
+      }
+
+      const formHtml = await payResponse.text();
+      const payWindow = window.open('', '_blank');
+      payWindow.document.write(formHtml);
+      payWindow.document.close();
 
       setFormData({
         chinese_name: '',
@@ -286,6 +318,34 @@ function App() {
                 </button>
               </div>
             ))}
+          </div>
+        </div>
+      )}
+      
+      {showPaymentModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white p-6 rounded-lg shadow-xl">
+            <h3 className="text-xl font-bold mb-4">选择支付方式</h3>
+            <div className="flex gap-4">
+              <button
+                onClick={() => handlePayment('alipay')}
+                className="bg-blue-500 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded"
+              >
+                支付宝支付
+              </button>
+              <button
+                onClick={() => handlePayment('wxpay')}
+                className="bg-green-500 hover:bg-green-700 text-white font-bold py-2 px-4 rounded"
+              >
+                微信支付
+              </button>
+            </div>
+            <button
+              onClick={() => setShowPaymentModal(false)}
+              className="mt-4 text-gray-600 hover:text-gray-800"
+            >
+              取消
+            </button>
           </div>
         </div>
       )}

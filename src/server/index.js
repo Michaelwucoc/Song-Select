@@ -3,6 +3,7 @@ const session = require('express-session');
 const path = require('path');
 const Database = require('better-sqlite3');
 const SpotifyWebApi = require('spotify-web-api-node');
+const EpayService = require('./epay');
 require('dotenv').config();
 
 const app = express();
@@ -19,6 +20,10 @@ db.exec(`
     cover_url TEXT,
     spotify_id TEXT,
     status TEXT DEFAULT 'pending',
+    priority INTEGER DEFAULT 0,
+    payment_status TEXT DEFAULT 'unpaid',
+    payment_amount DECIMAL(10,2) DEFAULT 5.00,
+    payment_time DATETIME,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
   )
 `);
@@ -83,20 +88,230 @@ app.post('/api/songs', async (req, res) => {
 });
 
 app.post('/api/songs/submit', (req, res) => {
-  const { chinese_name, english_name, song_name, artist, cover_url, spotify_id } = req.body;
+  const { chinese_name, english_name, song_name, artist, cover_url, spotify_id, priority } = req.body;
   
   try {
-    const stmt = db.prepare('INSERT INTO songs (chinese_name, english_name, song_name, artist, cover_url, spotify_id) VALUES (?, ?, ?, ?, ?, ?)');
-    stmt.run(chinese_name, english_name, song_name, artist, cover_url, spotify_id);
+    const stmt = db.prepare('INSERT INTO songs (chinese_name, english_name, song_name, artist, cover_url, spotify_id, priority) VALUES (?, ?, ?, ?, ?, ?, ?)');
+    stmt.run(chinese_name, english_name, song_name, artist, cover_url, spotify_id, priority || 0);
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: '保存点歌记录失败' });
   }
 });
 
+// 初始化易支付服务
+const epayService = new EpayService(
+  process.env.EPAY_MERCHANT_ID,
+  process.env.EPAY_MERCHANT_KEY,
+  process.env.EPAY_API_URL
+);
+
+// 支付相关路由
+app.post('/api/songs/:id/pay', async (req, res) => {
+  const { id } = req.params;
+  const { payType } = req.body;  // 确保从请求体中获取支付类型
+  const clientIp = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+
+  // 验证支付方式
+  if (!payType || !Object.values(EpayService.PAYMENT_TYPES).includes(payType)) {
+    return res.status(400).json({ error: '无效的支付方式' });
+  }
+
+  try {
+    const song = db.prepare('SELECT song_name, payment_amount FROM songs WHERE id = ?').get(id);
+    if (!song) {
+      return res.status(404).json({ error: '未找到该歌曲' });
+    }
+    
+    const orderId = `song_${id}_${Date.now()}`;
+    const formHtml = await epayService.createPaymentOrder(
+      orderId, 
+      song.payment_amount, 
+      song.song_name,
+      payType,  // 确保传递正确的支付类型
+      clientIp
+    );
+    
+    res.send(formHtml);
+  } catch (error) {
+    console.error('创建支付订单失败:', error);
+    res.status(500).json({ error: '创建支付订单失败' });
+  }
+});
+
+// 支付异步通知
+app.all('/api/epay/notify', async (req, res) => {
+  const params = { ...req.query, ...req.body };
+  
+  console.log('收到支付回调:', params);
+  
+  // 验证签名
+  if (!epayService.verifyNotify(params)) {
+    console.error('签名验证失败');
+    return res.status(400).send('fail');
+  }
+
+  // 验证支付状态
+  if (params.trade_status !== 'TRADE_SUCCESS') {
+    console.error('支付未成功');
+    return res.status(400).send('fail');
+  }
+
+  try {
+    const orderId = params.out_trade_no;
+    const songId = orderId.split('_')[1];
+    
+    // 更新支付状态
+    const stmt = db.prepare(`
+      UPDATE songs 
+      SET payment_status = ?, 
+          payment_amount = ?, 
+          payment_time = CURRENT_TIMESTAMP,
+          priority = 1 
+      WHERE id = ?
+    `);
+    
+    const result = stmt.run('paid', params.money, songId);
+    console.log('更新支付状态:', result);
+
+    res.send('success');
+  } catch (error) {
+    console.error('处理支付回调失败:', error);
+    res.status(500).send('fail');
+  }
+});
+
+// 支付页面跳转通知
+app.get('/api/epay/return', (req, res) => {
+  const params = req.query;
+  
+  console.log('收到支付页面跳转通知:', params);
+  
+  if (!epayService.verifyNotify(params)) {
+    return res.redirect('/songs?payment=failed');
+  }
+
+  if (params.trade_status !== 'TRADE_SUCCESS') {
+    return res.redirect('/songs?payment=failed');
+  }
+
+  return res.redirect('/songs?payment=success');
+});
+
+// 添加支付状态缓存
+const paymentStatusCache = new Map();
+
+// 支付状态查询接口
+app.get('/api/songs/:id/payment-status', async (req, res) => {
+  const { id } = req.params;
+  
+  try {
+    // 检查缓存
+    const cachedStatus = paymentStatusCache.get(id);
+    if (cachedStatus) {
+      return res.json({ status: cachedStatus });
+    }
+
+    const song = db.prepare('SELECT payment_status FROM songs WHERE id = ?').get(id);
+    if (!song) {
+      return res.status(404).json({ error: '未找到该歌曲' });
+    }
+
+    // 如果状态是已支付，则缓存结果
+    if (song.payment_status === 'paid') {
+      paymentStatusCache.set(id, song.payment_status);
+    }
+
+    res.json({ status: song.payment_status });
+  } catch (error) {
+    console.error('查询支付状态失败:', error);
+    res.status(500).json({ error: '查询支付状态失败' });
+  }
+});
+
+// 在支付成功回调中更新缓存
+app.all('/api/epay/notify', async (req, res) => {
+  const params = { ...req.query, ...req.body };
+  
+  console.log('收到支付回调:', params);
+  
+  // 验证签名
+  if (!epayService.verifyNotify(params)) {
+    console.error('签名验证失败');
+    return res.status(400).send('fail');
+  }
+
+  // 验证支付状态
+  if (params.trade_status !== 'TRADE_SUCCESS') {
+    console.error('支付未成功');
+    return res.status(400).send('fail');
+  }
+
+  try {
+    const orderId = params.out_trade_no;
+    const songId = orderId.split('_')[1];
+    
+    // 更新支付状态
+    const stmt = db.prepare(`
+      UPDATE songs 
+      SET payment_status = ?, 
+          payment_amount = ?, 
+          payment_time = CURRENT_TIMESTAMP,
+          priority = 1 
+      WHERE id = ?
+    `);
+    
+    const result = stmt.run('paid', params.money, songId);
+    
+    // 更新缓存
+    paymentStatusCache.set(songId, 'paid');
+    
+    console.log('更新支付状态:', result);
+    res.send('success');
+  } catch (error) {
+    console.error('处理支付回调失败:', error);
+    res.status(500).send('fail');
+  }
+});
+
+// 添加GET路由处理易支付的return_url回调
+app.get('/api/epay/notify', (req, res) => {
+  const params = req.query;
+  
+  console.log('收到支付页面跳转通知:', params);
+  
+  if (!epayService.verifyNotify(params)) {
+    return res.redirect('/songs?payment=failed');
+  }
+
+  try {
+    const orderId = params.out_trade_no;
+    const songId = orderId.split('_')[1];
+    const stmt = db.prepare('UPDATE songs SET payment_status = ?, payment_amount = ?, payment_time = CURRENT_TIMESTAMP, priority = 1 WHERE id = ?');
+    stmt.run('paid', params.money, songId);
+    return res.redirect('/songs?payment=success');
+  } catch (error) {
+    console.error('处理支付跳转通知失败:', error);
+    return res.redirect('/songs?payment=error');
+  }
+});
+
+app.get('/api/songs/payment/:id', (req, res) => {
+  const { id } = req.params;
+  try {
+    const song = db.prepare('SELECT payment_status, payment_amount FROM songs WHERE id = ?').get(id);
+    if (!song) {
+      return res.status(404).json({ error: '未找到该歌曲' });
+    }
+    res.json(song);
+  } catch (error) {
+    res.status(500).json({ error: '获取支付状态失败' });
+  }
+});
+
 app.get('/api/songs', (req, res) => {
   try {
-    const songs = db.prepare('SELECT * FROM songs ORDER BY created_at DESC').all();
+    const songs = db.prepare('SELECT * FROM songs ORDER BY priority DESC, created_at DESC').all();
     res.json(songs);
   } catch (error) {
     res.status(500).json({ error: '获取点歌列表失败' });
@@ -153,4 +368,24 @@ if (process.env.NODE_ENV === 'production') {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`服务器运行在端口 ${PORT}`);
+});
+
+
+// 添加优先级设置接口
+app.post('/api/songs/:id/priority', (req, res) => {
+  const { id } = req.params;
+  const { admin_password, priority } = req.body;
+
+  if (admin_password !== process.env.ADMIN_PASSWORD) {
+    return res.status(403).json({ error: '管理员密码错误' });
+  }
+
+  try {
+    const stmt = db.prepare('UPDATE songs SET priority = ? WHERE id = ?');
+    stmt.run(priority, id);
+    res.json({ success: true });
+  } catch (error) {
+    console.error('设置优先级失败:', error);
+    res.status(500).json({ error: '设置优先级失败' });
+  }
 });
