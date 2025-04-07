@@ -85,6 +85,21 @@ class EpayService {
     params.sign = this.generateSign(params);
     return this.createPaymentForm(params);
   }
+
+  verifyNotify(params) {
+    // 验证签名
+    const sign = params.sign;
+    const signType = params.sign_type;
+    
+    // 如果没有签名或签名类型，验证失败
+    if (!sign || !signType || signType !== 'MD5') {
+      return false;
+    }
+
+    // 生成新的签名进行对比
+    const newSign = this.generateSign(params);
+    return newSign === sign;
+  }
 }
 
 // 添加这行来导出类
